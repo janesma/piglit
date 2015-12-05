@@ -117,8 +117,6 @@ class JUnitBackend(FileBackend):
 
         shutil.rmtree(os.path.join(self._dest, 'tests'))
 
-
-
     def _write(self, f, name, data):
         # Split the name of the test and the group (what junit refers to as
         # classname), and replace piglits '/' separated groups with '.', after
@@ -135,11 +133,41 @@ class JUnitBackend(FileBackend):
         # set different root names.
         classname = 'piglit.' + classname
 
-        element = self.__make_case(testname, classname, data)
+        if data.subtests:
+            # If there are subtests treat the test as a suite instead of a
+            # test, set system-out, system-err, and time on the suite rather
+            # than on the testcase
+            name='{}.{}'.format(classname, testname)
+            element = etree.Element(
+                'testsuite',
+                name=name,
+                time=str(data.time.total))
+
+            out = etree.SubElement(element, 'system-out')
+            out.text = data.command + '\n' + data.out
+            err = etree.SubElement(element, 'system-err')
+            err.text = data.err
+            err.text += '\n\nstart time: {}\nend time: {}\n'.format(
+                data.time.start, data.time.end)
+
+            for name, result in data.subtests.iteritems():
+                sub = self.__make_subcase(name, result, err)
+                out = etree.SubElement(sub, 'system-out')
+                out.text = 'I am a subtest of {}'.format(name)
+                element.append(sub)
+
+            for attrib, xpath in [('failures', './/testcase/failure'),
+                                  ('errors', './/testcase/error'),
+                                  ('skipped', './/testcase/skipped'),
+                                  ('tests', './/testcase')]:
+                element.attrib[attrib] = str(len(element.findall(xpath)))
+
+        else:
+            element = self.__make_case(testname, classname, data)
+
         f.write(etree.tostring(element))
 
-    def __make_case(self, testname, classname, data):
-        """Create a test case element and return it."""
+    def __make_name(self, testname):
         # Jenkins will display special pages when the test has certain names,
         # so add '_' so the tests don't match those names
         # https://jenkins-ci.org/issue/18062
@@ -148,17 +176,68 @@ class JUnitBackend(FileBackend):
         if full_test_name in _JUNIT_SPECIAL_NAMES:
             testname += '_'
             full_test_name = testname + self._test_suffix
+        return full_test_name
+
+    def __make_subcase(self, testname, result, err):
+        """Create a <testcase> element for subtests.
+
+        This method is used to create a <testcase> element to nest inside of a
+        <testsuite> element when that element represents a test with subtests.
+        This differs from __make_case in that it doesn't add as much metadata
+        to the <testcase>, since that was attached to the <testsuite> by
+        _write, and that it doesn't handle incomplete cases, since subtests
+        cannot have incomplete as a status (though that could change).
+
+        """
+        full_test_name = self.__make_name(testname)
+        element = etree.Element('testcase',
+                                name=full_test_name,
+                                status=str(result))
+
+        # replace special characters and make case insensitive
+        lname = self.__normalize_name(testname)
+
+        expected_result = "pass"
+
+        if lname in self._expected_failures:
+            expected_result = "failure"
+            # a test can either fail or crash, but not both
+            assert lname not in self._expected_crashes
+
+        if lname in self._expected_crashes:
+            expected_result = "error"
+
+        self.__add_result(element, result, err, expected_result)
+
+        return element
+
+    def __make_case(self, testname, classname, data):
+        """Create a <testcase> element and return it.
+
+        Specifically, this is used to create "normal" test case, one that
+        doesn't contain any subtests. __make_subcase is used to create a
+        <testcase> which belongs inside a nested <testsuite> node.
+
+        Arguments:
+        testname -- the name of the test
+        classname -- the name of the group (to use piglit terminology)
+        data -- A TestResult instance
+
+        """
+        full_test_name = self.__make_name(testname)
 
         # Create the root element
-        element = etree.Element('testcase', name=full_test_name,
+        element = etree.Element('testcase',
+                                name=full_test_name,
                                 classname=classname,
-                                # Incomplete will not have a time.
                                 time=str(data.time.total),
                                 status=str(data.result))
 
         # If this is an incomplete status then none of these values will be
         # available, nor
         if data.result != 'incomplete':
+            expected_result = "pass"
+
             # Add stdout
             out = etree.SubElement(element, 'system-out')
             out.text = data.out
@@ -171,7 +250,8 @@ class JUnitBackend(FileBackend):
             err.text = data.err
             err.text += '\n\nstart time: {}\nend time: {}\n'.format(
                 data.time.start, data.time.end)
-            expected_result = "pass"
+
+            element.extend([err, out])
 
             # replace special characters and make case insensitive
             lname = self.__normalize_name(classname, testname)
@@ -184,29 +264,34 @@ class JUnitBackend(FileBackend):
             if lname in self._expected_crashes:
                 expected_result = "error"
 
-            self.__add_result(element, data, err, expected_result)
+            self.__add_result(element, data.result, err, expected_result)
         else:
             etree.SubElement(element, 'failure', message='Incomplete run.')
 
         return element
 
     @staticmethod
-    def __normalize_name(classname, testname):
-        name = (classname + "." + testname).lower()
+    def __normalize_name(testname, classname=None):
+        """Nomralize the test name to what is stored in the expected statuses.
+        """
+        if classname is not None:
+            name = (classname + "." + testname).lower()
+        else:
+            name = testname.lower()
         name = name.replace("=", ".")
         name = name.replace(":", ".")
         return name
 
     @staticmethod
-    def __add_result(element, data, err, expected_result):
-        """Add a <skipped>, <failure>, or <error> if necissary."""
+    def __add_result(element, result, err, expected_result):
+        """Add a <skipped>, <failure>, or <error> if necessary."""
         res = None
         # Add relevant result value, if the result is pass then it doesn't
         # need one of these statuses
-        if data.result == 'skip':
+        if result == 'skip':
             res = etree.SubElement(element, 'skipped')
 
-        elif data.result in ['fail', 'dmesg-warn', 'dmesg-fail']:
+        elif result in ['fail', 'dmesg-warn', 'dmesg-fail']:
             if expected_result == "failure":
                 err.text += "\n\nWARN: passing test as an expected failure"
                 res = etree.SubElement(element, 'skipped',
@@ -214,7 +299,7 @@ class JUnitBackend(FileBackend):
             else:
                 res = etree.SubElement(element, 'failure')
 
-        elif data.result == 'crash':
+        elif result == 'crash':
             if expected_result == "error":
                 err.text += "\n\nWARN: passing test as an expected crash"
                 res = etree.SubElement(element, 'skipped',
@@ -229,7 +314,7 @@ class JUnitBackend(FileBackend):
 
         # Add the piglit type to the failure result
         if res is not None:
-            res.attrib['type'] = str(data.result)
+            res.attrib['type'] = str(result)
 
 
 def _load(results_file):
@@ -242,6 +327,27 @@ def _load(results_file):
     JUnit document.
 
     """
+    def populate_result(result, test):
+        # This is the fallback path, we'll try to overwrite this with the value
+        # in stderr
+        result.time = results.TimeAttribute(end=float(test.attrib['time']))
+        result.err = test.find('system-err').text
+
+        # The command is prepended to system-out, so we need to separate those
+        # into two separate elements
+        out = test.find('system-out').text.split('\n')
+        result.command = out[0]
+        result.out = '\n'.join(out[1:])
+
+        # Try to get the values in stderr for time
+        if 'time start' in result.err:
+            for line in result.err.split('\n'):
+                if line.startswith('time start:'):
+                    result.time.start = float(line[len('time start: '):])
+                elif line.startswith('time end:'):
+                    result.time.end = float(line[len('time end: '):])
+                    break
+
     run_result = results.TestrunResult()
 
     splitpath = os.path.splitext(results_file)[0].split(os.path.sep)
@@ -267,25 +373,25 @@ def _load(results_file):
 
         result.result = test.attrib['status']
 
-        # This is the fallback path, we'll try to overwrite this with the value
-        # in stderr
-        result.time = results.TimeAttribute(end=float(test.attrib['time']))
-        result.err = test.find('system-err').text
+        populate_result(result, test)
 
-        # The command is prepended to system-out, so we need to separate those
-        # into two separate elements
-        out = test.find('system-out').text.split('\n')
-        result.command = out[0]
-        result.out = '\n'.join(out[1:])
+        run_result.tests[name] = result
 
-        # Try to get the values in stderr for time
-        if 'time start' in result.err:
-            for line in result.err.split('\n'):
-                if line.startswith('time start:'):
-                    result.time.start = float(line[len('time start: '):])
-                elif line.startswith('time end:'):
-                    result.time.end = float(line[len('time end: '):])
-                    break
+    for test in tree.iterfind('testsuite'):
+        result = results.TestResult()
+        # Take the class name minus the 'piglit.' element, replace junit's '.'
+        # separator with piglit's separator, and join the group and test names
+        name = test.attrib['name'].split('.', 1)[1]
+        name = name.replace('.', grouptools.SEPARATOR)
+
+        # Remove the trailing _ if they were added (such as to api and search)
+        if name.endswith('_'):
+            name = name[:-1]
+
+        populate_result(result, test)
+
+        for subtest in test.iterfind('testcase'):
+            result.subtests[subtest.attrib['name']] = subtest.attrib['status']
 
         run_result.tests[name] = result
 

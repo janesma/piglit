@@ -29,6 +29,7 @@ try:
     from lxml import etree
 except ImportError:
     import xml.etree.cElementTree as etree
+import mock
 import nose.tools as nt
 from nose.plugins.skip import SkipTest
 
@@ -44,7 +45,7 @@ doc_formatter = utils.DocFormatter({'separator': grouptools.SEPARATOR})
 _XML = """\
 <?xml version='1.0' encoding='utf-8'?>
   <testsuites>
-    <testsuite name="piglit" tests="1">
+    <testsuite name="piglit" tests="5">
       <testcase classname="piglit.foo.bar" name="a-test" status="pass" time="1.12345">
         <system-out>this/is/a/command\nThis is stdout</system-out>
         <system-err>this is stderr
@@ -53,6 +54,24 @@ time start: 1.0
 time end: 4.5
         </system-err>
       </testcase>
+      <testsuite name="piglit.bar" time="1.234" tests="4" failures="1" skipped="1" errors="1">
+        <system-err>this is stderr
+
+time start: 1.0
+time end: 4.5
+</system-err>
+        <system-out>this/is/a/command\nThis is stdout</system-out>
+        <testcase name="subtest1" status="pass"/>
+        <testcase name="subtest2" status="fail">
+          <failed/>
+        </testcase>
+        <testcase name="subtest3" status="crash">
+          <error/>
+        </testcase>
+        <testcase name="subtest4" status="skip">
+          <skipped/>
+        </testcase>
+      </testsuite>
     </testsuite>
   </testsuites>
 """
@@ -203,11 +222,12 @@ class TestJUnitLoad(utils.StaticDirectory):
     def setup_class(cls):
         super(TestJUnitLoad, cls).setup_class()
         cls.xml_file = os.path.join(cls.tdir, 'results.xml')
-        
+
         with open(cls.xml_file, 'w') as f:
             f.write(_XML)
 
         cls.testname = grouptools.join('foo', 'bar', 'a-test')
+        cls.subtestname = 'bar'
 
     @classmethod
     def xml(cls):
@@ -270,7 +290,6 @@ class TestJUnitLoad(utils.StaticDirectory):
         """backends.junit._load: Totals are calculated."""
         nt.ok_(bool(self.xml()))
 
-
     @utils.no_error
     def test_load_file(self):
         """backends.junit.load: Loads a file directly"""
@@ -280,6 +299,48 @@ class TestJUnitLoad(utils.StaticDirectory):
     def test_load_dir(self):
         """backends.junit.load: Loads a directory"""
         backends.junit.REGISTRY.load(self.tdir, 'none')
+
+    def test_subtest_added(self):
+        """backends.junit._load: turns secondlevel <testsuite> into test with stubtests"""
+        xml = self.xml()
+        nt.assert_in(self.subtestname, xml.tests)
+
+    def test_subtest_time(self):
+        """backends.junit._load: handles time from subtest"""
+        time = self.xml().tests[self.subtestname].time
+        nt.assert_is_instance(time, results.TimeAttribute)
+        nt.eq_(time.start, 1.0)
+        nt.eq_(time.end, 4.5)
+
+    def test_subtest_out(self):
+        """backends.junit._load: subtest stderr is loaded correctly"""
+        test = self.xml().tests[self.subtestname].out
+        nt.eq_(test, 'This is stdout')
+
+    def test_subtest_err(self):
+        """backends.junit._load: stderr is loaded correctly."""
+        test = self.xml().tests[self.subtestname].err
+        nt.eq_(test, 'this is stderr\n\ntime start: 1.0\ntime end: 4.5\n')
+
+    def test_subtest_statuses(self):
+        """backends.juint._load: subtest statuses are restored correctly
+
+        This is not implemented as separate tests or a generator becuase while
+        it asserts multiple values, it is testing one peice of funcitonality:
+        whether the subtests are restored correctly.
+
+        """
+        test = self.xml().tests[self.subtestname]
+
+        subtests = [
+            ('subtest1', 'pass'),
+            ('subtest2', 'fail'),
+            ('subtest3', 'crash'),
+            ('subtest4', 'skip'),
+        ]
+
+        for name, value in subtests:
+            nt.eq_(test.subtests[name], value)
 
 
 def test_load_file_name():
@@ -319,3 +380,142 @@ def test_load_default_name():
         test = backends.junit.REGISTRY.load(filename, 'none')
 
     nt.assert_equal(test.name, 'junit result')
+
+
+class TestJunitSubtestWriting(object):
+    """Tests for Junit subtest writing.
+
+    Junit needs to write out subtests as full tests, so jenkins will consume
+    them correctly.
+
+    """
+    __patchers = [
+        mock.patch('framework.backends.abstract.shutil.move', mock.Mock()),
+    ]
+
+    @staticmethod
+    def _make_result():
+        result = results.TestResult()
+        result.time.end = 1.2345
+        result.result = 'pass'
+        result.out = 'this is stdout'
+        result.err = 'this is stderr'
+        result.command = 'foo'
+        result.subtests['foo'] = 'skip'
+        result.subtests['bar'] = 'fail'
+        result.subtests['oink'] = 'crash'
+
+        test = backends.junit.JUnitBackend('foo')
+        mock_open = mock.mock_open()
+        with mock.patch('framework.backends.abstract.open', mock_open):
+            with test.write_test(grouptools.join('a', 'group', 'test1')) as t:
+                t(result)
+
+        # Return an xml object
+        # This seems pretty fragile, but I don't see a better way to get waht
+        # we want
+        return etree.fromstring(mock_open.mock_calls[-3][1][0])
+
+    @classmethod
+    def setup_class(cls):
+        for p in cls.__patchers:
+            p.start()
+
+        cls.output = cls._make_result()
+
+    @classmethod
+    def teardown_class(cls):
+        for p in cls.__patchers:
+            p.stop()
+
+    def test_suite(self):
+        """backends.junit.JUnitBackend.write_test: wraps the cases in a suite"""
+        nt.eq_(self.output.tag, 'testsuite')
+
+    def test_cases(self):
+        """backends.junit.JUnitBackend.write_test: has one <testcase> per subtest"""
+        nt.eq_(len(self.output.findall('testcase')), 3)
+
+    @utils.nose_generator
+    def test_metadata(self):
+        """backends.junit.JUnitBackend.write_test: metadata written into the
+        suite
+
+        """
+        def test(actual, expected):
+            nt.eq_(expected, actual)
+
+        descrption = ('backends.junit.JUnitBackend.write_test: '
+                      '{} is written into the suite')
+
+        if self.output.tag != 'testsuite':
+            raise Exception('Could not find a testsuite!')
+
+        tests = [
+            (self.output.find('system-out').text, 'this is stdout',
+             'system-out'),
+            (self.output.find('system-err').text,
+             'this is stderr\n\nstart time: 0.0\nend time: 1.2345\n',
+             'system-err'),
+            (self.output.attrib.get('name'), 'piglit.a.group.test1', 'name'),
+            (self.output.attrib.get('time'), '1.2345', 'timestamp'),
+            (self.output.attrib.get('failures'), '1', 'failures'),
+            (self.output.attrib.get('skipped'), '1', 'skipped'),
+            (self.output.attrib.get('errors'), '1', 'errors'),
+            (self.output.attrib.get('tests'), '3', 'tests'),
+        ]
+
+        for actual, expected, name in tests:
+            test.description = descrption.format(name)
+            yield test, actual, expected
+
+    def test_testname(self):
+        """backends.junit.JUnitBackend.write_test: the testname should be the subtest name"""
+        nt.ok_(self.output.find('testcase[@name="foo"]') is not None)
+
+    def test_fail(self):
+        """Backends.junit.JUnitBackend.write_test: add <failure> if the subtest failed"""
+        nt.eq_(len(self.output.find('testcase[@name="bar"]').findall('failure')), 1)
+
+    def test_skip(self):
+        """Backends.junit.JUnitBackend.write_test: add <skipped> if the subtest skipped"""
+        nt.eq_(len(self.output.find('testcase[@name="foo"]').findall('skipped')), 1)
+
+    def test_error(self):
+        """Backends.junit.JUnitBackend.write_test: add <error> if the subtest crashed"""
+        nt.eq_(len(self.output.find('testcase[@name="oink"]').findall('error')), 1)
+
+
+class TestJunitSubtestFinalize(utils.StaticDirectory):
+    @classmethod
+    def setup_class(cls):
+        super(TestJunitSubtestFinalize, cls).setup_class()
+
+        result = results.TestResult()
+        result.time.end = 1.2345
+        result.result = 'pass'
+        result.out = 'this is stdout'
+        result.err = 'this is stderr'
+        result.command = 'foo'
+        result.subtests['foo'] = 'pass'
+        result.subtests['bar'] = 'fail'
+
+        test = backends.junit.JUnitBackend(cls.tdir)
+        test.initialize(BACKEND_INITIAL_META)
+        with test.write_test(grouptools.join('a', 'test', 'group', 'test1')) as t:
+            t(result)
+        test.finalize()
+
+    @utils.not_raises(etree.ParseError)
+    def test_valid_xml(self):
+        """backends.jUnit.JunitBackend.finalize: produces valid xml with subtests"""
+        etree.parse(os.path.join(self.tdir, 'results.xml'))
+
+    def test_valid_junit(self):
+        """backends.jUnit.JunitBackend.finalize: prodives valid junit with subtests"""
+        if etree.__name__ != 'lxml.etree':
+            raise SkipTest('Test requires lxml features')
+
+        schema = etree.XMLSchema(file=JUNIT_SCHEMA)
+        xml = etree.parse(os.path.join(self.tdir, 'results.xml'))
+        nt.ok_(schema.validate(xml), msg='xml is not valid')
