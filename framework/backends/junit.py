@@ -117,56 +117,9 @@ class JUnitBackend(FileBackend):
 
         shutil.rmtree(os.path.join(self._dest, 'tests'))
 
+
+
     def _write(self, f, name, data):
-
-        def calculate_result():
-            """Set the result."""
-            expected_result = "pass"
-
-            # replace special characters and make case insensitive
-            lname = (classname + "." + testname).lower()
-            lname = lname.replace("=", ".")
-            lname = lname.replace(":", ".")
-
-            if lname in self._expected_failures:
-                expected_result = "failure"
-                # a test can either fail or crash, but not both
-                assert lname not in self._expected_crashes
-
-            if lname in self._expected_crashes:
-                expected_result = "error"
-
-            res = None
-            # Add relevant result value, if the result is pass then it doesn't
-            # need one of these statuses
-            if data.result == 'skip':
-                res = etree.SubElement(element, 'skipped')
-
-            elif data.result in ['fail', 'dmesg-warn', 'dmesg-fail']:
-                if expected_result == "failure":
-                    err.text += "\n\nWARN: passing test as an expected failure"
-                    res = etree.SubElement(element, 'skipped',
-                                           message='expected failure')
-                else:
-                    res = etree.SubElement(element, 'failure')
-
-            elif data.result == 'crash':
-                if expected_result == "error":
-                    err.text += "\n\nWARN: passing test as an expected crash"
-                    res = etree.SubElement(element, 'skipped',
-                                           message='expected crash')
-                else:
-                    res = etree.SubElement(element, 'error')
-
-            elif expected_result != "pass":
-                err.text += "\n\nERROR: This test passed when it "\
-                            "expected {0}".format(expected_result)
-                res = etree.SubElement(element, 'failure')
-
-            # Add the piglit type to the failure result
-            if res is not None:
-                res.attrib['type'] = str(data.result)
-
         # Split the name of the test and the group (what junit refers to as
         # classname), and replace piglits '/' separated groups with '.', after
         # replacing any '.' with '_' (so we don't get false groups).
@@ -182,11 +135,15 @@ class JUnitBackend(FileBackend):
         # set different root names.
         classname = 'piglit.' + classname
 
-        # Jenkins will display special pages when the test has certain names.
+        element = self.__make_case(testname, classname, data)
+        f.write(etree.tostring(element))
+
+    def __make_case(self, testname, classname, data):
+        """Create a test case element and return it."""
+        # Jenkins will display special pages when the test has certain names,
+        # so add '_' so the tests don't match those names
         # https://jenkins-ci.org/issue/18062
         # https://jenkins-ci.org/issue/19810
-        # The testname variable is used in the calculate_result
-        # closure, and must not have the suffix appended.
         full_test_name = testname + self._test_suffix
         if full_test_name in _JUNIT_SPECIAL_NAMES:
             testname += '_'
@@ -214,11 +171,65 @@ class JUnitBackend(FileBackend):
             err.text = data.err
             err.text += '\n\nstart time: {}\nend time: {}\n'.format(
                 data.time.start, data.time.end)
-            calculate_result()
+            expected_result = "pass"
+
+            # replace special characters and make case insensitive
+            lname = self.__normalize_name(classname, testname)
+
+            if lname in self._expected_failures:
+                expected_result = "failure"
+                # a test can either fail or crash, but not both
+                assert lname not in self._expected_crashes
+
+            if lname in self._expected_crashes:
+                expected_result = "error"
+
+            self.__add_result(element, data, err, expected_result)
         else:
             etree.SubElement(element, 'failure', message='Incomplete run.')
 
-        f.write(etree.tostring(element))
+        return element
+
+    @staticmethod
+    def __normalize_name(classname, testname):
+        name = (classname + "." + testname).lower()
+        name = name.replace("=", ".")
+        name = name.replace(":", ".")
+        return name
+
+    @staticmethod
+    def __add_result(element, data, err, expected_result):
+        """Add a <skipped>, <failure>, or <error> if necissary."""
+        res = None
+        # Add relevant result value, if the result is pass then it doesn't
+        # need one of these statuses
+        if data.result == 'skip':
+            res = etree.SubElement(element, 'skipped')
+
+        elif data.result in ['fail', 'dmesg-warn', 'dmesg-fail']:
+            if expected_result == "failure":
+                err.text += "\n\nWARN: passing test as an expected failure"
+                res = etree.SubElement(element, 'skipped',
+                                       message='expected failure')
+            else:
+                res = etree.SubElement(element, 'failure')
+
+        elif data.result == 'crash':
+            if expected_result == "error":
+                err.text += "\n\nWARN: passing test as an expected crash"
+                res = etree.SubElement(element, 'skipped',
+                                       message='expected crash')
+            else:
+                res = etree.SubElement(element, 'error')
+
+        elif expected_result != "pass":
+            err.text += "\n\nERROR: This test passed when it "\
+                        "expected {0}".format(expected_result)
+            res = etree.SubElement(element, 'failure')
+
+        # Add the piglit type to the failure result
+        if res is not None:
+            res.attrib['type'] = str(data.result)
 
 
 def _load(results_file):
