@@ -84,7 +84,7 @@ struct image_test_info {
 const struct image_test_info image_tests[] = {
         { "control", "", "", true },
         { "'coherent' qualifier", "coherent", "memoryBarrier()", false },
-        { "'volatile' qualifier", "volatile", "", false },
+        { "'volatile' qualifier", "volatile", "memoryBarrier()", false },
         { 0 }
 };
 
