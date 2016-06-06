@@ -388,7 +388,7 @@ vertex_attrib_description::parse_datum(const char **text, void *data) const
 	}
 	case GL_INT: {
 		long long value = strtoll(*text, &endptr, 0);
-		if (errno == ERANGE || (unsigned long long) value > 0xFFFFFFFFull) {
+		if (errno == ERANGE) {
 			printf("Could not parse as signed integer\n");
 			return false;
 		}
