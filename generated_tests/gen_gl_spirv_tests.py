@@ -1225,7 +1225,10 @@ def process_shader_test(shader_test, config, skip_reasons):
         directory_name = os.path.dirname(spv_shader_test_file)
 
         if not os.path.exists(directory_name):
-            os.makedirs(directory_name)
+            try:
+                os.makedirs(directory_name)
+            except:
+                assert(os.path.exists(directory_name))
     else:
         spv_shader_test_file = shader_test.path + '.spv'
 
